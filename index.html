@@ -4,7 +4,6 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Bass Note Guessing Game</title>
-  <!-- Pitch detection library -->
   <script src="https://cdn.jsdelivr.net/npm/pitchfinder@1.3.2/dist/pitchfinder.min.js"></script>
   <style>
     :root {
@@ -70,10 +69,9 @@
     }
     .marker { width: 18px; height: 18px; background: var(--accent); }
     .inlay { width: 14px; height: 14px; background: var(--fg); opacity: 0.3; }
-    .inlay.double { width: 12px; height: 12px; }
     #message { font-size: 1.25rem; font-weight: 600; min-height: 1.5rem; text-align: center; }
-    #tuner { font-size: 1.5rem; font-family: monospace; min-height: 2rem; }
-    #detected-note { font-weight: 700; margin-right: 0.5rem; }
+    #tuner { font-size: 1.4rem; font-family: monospace; min-height: 2rem; }
+    #detected-note { font-weight: 700; margin-right: 0.35rem; }
   </style>
 </head>
 <body>
@@ -81,6 +79,7 @@
     <span>Next note:</span>
     <span id="target-note">---</span>
     <button id="skip-btn">Show me the correct note</button>
+    <button id="next-btn">Next note</button>
     <label>
       <input type="checkbox" id="stringMode" /> Specify String
     </label>
@@ -93,24 +92,26 @@
   <script>
     /************ CONFIG ************/
     const strings = [
-      { name: "G", openFreq: 98.0, midi: 43 }, // G2
-      { name: "D", openFreq: 73.42, midi: 38 }, // D2
-      { name: "A", openFreq: 55.0, midi: 33 }, // A1
-      { name: "E", openFreq: 41.2, midi: 28 }, // E1
+      { name: "G", openFreq: 98.0, midi: 43 },
+      { name: "D", openFreq: 73.42, midi: 38 },
+      { name: "A", openFreq: 55.0, midi: 33 },
+      { name: "E", openFreq: 41.2, midi: 28 }
     ];
     const lowestMidi = 28; // E1
     const highestMidi = 62; // D4
     const fretCount = 20;
     const inlayFrets = [3, 5, 7, 9, 12, 15, 17, 19];
+    const acceptCents = 50; // pitch tolerance for a correct answer
 
     /************ STATE & DOM ************/
-    let target = null; // { midi, name, stringIndex|null, fret|null }
+    let target = null;
     let waiting = false;
 
     const targetEl = document.getElementById("target-note");
     const boardEl = document.getElementById("fretboard");
     const messageEl = document.getElementById("message");
     const skipBtn = document.getElementById("skip-btn");
+    const nextBtn = document.getElementById("next-btn");
     const stringModeChk = document.getElementById("stringMode");
     const tunerNoteEl = document.getElementById("detected-note");
     const tunerCentsEl = document.getElementById("detected-cents");
@@ -118,18 +119,18 @@
     /************ BUILD FRETBOARD ************/
     let paddingTop, stringGap;
     function buildBoard() {
-      boardEl.innerHTML = ""; // reset if rebuilding
+      boardEl.innerHTML = "";
       paddingTop = 20;
       stringGap = (boardEl.clientHeight - paddingTop * 2) / (strings.length - 1);
 
       // strings
-      strings.forEach((s, i) => {
-        const y = paddingTop + i * stringGap;
+      strings.forEach((_, i) => {
         const line = document.createElement("div");
         line.className = "string-line";
-        line.style.top = y + "px";
+        line.style.top = `${paddingTop + i * stringGap}px`;
         boardEl.appendChild(line);
       });
+
       // frets
       for (let f = 0; f <= fretCount; f++) {
         const line = document.createElement("div");
@@ -137,72 +138,91 @@
         line.style.left = `${(f / fretCount) * 100}%`;
         boardEl.appendChild(line);
       }
+
       // inlays
       inlayFrets.forEach(f => {
-        const xPct = ((f - 0.5) / fretCount) * 100;
-        const inlay = document.createElement("div");
-        inlay.className = "inlay";
-        if (f === 12) inlay.classList.add("double");
-        inlay.style.left = `${xPct}%`;
-        inlay.style.top = `${boardEl.clientHeight / 2}px`;
-        boardEl.appendChild(inlay);
+        if (f === 12) {
+          // double-dot: one above, one below centre
+          const xPct = ((f - 0.5) / fretCount) * 100;
+          const yCenter = boardEl.clientHeight / 2;
+          const offset = stringGap * 0.6;
+          [yCenter - offset, yCenter + offset].forEach(y => {
+            const dot = document.createElement("div");
+            dot.className = "inlay";
+            dot.style.left = `${xPct}%`;
+            dot.style.top = `${y}px`;
+            boardEl.appendChild(dot);
+          });
+        } else {
+          const xPct = ((f - 0.5) / fretCount) * 100;
+          const dot = document.createElement("div");
+          dot.className = "inlay";
+          dot.style.left = `${xPct}%`;
+          dot.style.top = `${boardEl.clientHeight / 2}px`;
+          boardEl.appendChild(dot);
+        }
       });
     }
-    // Build after layout paint
     requestAnimationFrame(buildBoard);
 
-    /************ AUDIO INIT ************/
-    let audioCtx, analyser, dataArray, yinDetector;
+    /************ AUDIO & DETECTION ************/
+    let audioCtx, analyser, dataArray, detector;
     async function initAudio() {
-      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      const source = audioCtx.createMediaStreamSource(stream);
-      analyser = audioCtx.createAnalyser();
-      analyser.fftSize = 2048;
-      dataArray = new Float32Array(analyser.fftSize);
-      source.connect(analyser);
-      yinDetector = Pitchfinder.YIN({ sampleRate: audioCtx.sampleRate });
-      listenLoop();
+      try {
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        const source = audioCtx.createMediaStreamSource(stream);
+        analyser = audioCtx.createAnalyser();
+        analyser.fftSize = 2048;
+        dataArray = new Float32Array(analyser.fftSize);
+        source.connect(analyser);
+        // AMDF tends to be more forgiving for bass frequencies
+        detector = Pitchfinder.AMDF({ sampleRate: audioCtx.sampleRate });
+        listenLoop();
+      } catch (err) {
+        messageEl.textContent = "Mic access denied.";
+        console.error(err);
+      }
     }
 
     function listenLoop() {
       analyser.getFloatTimeDomainData(dataArray);
-      const freq = yinDetector(dataArray);
-      updateTuner(freq);
-      if (freq) verifyPitch(freq);
+      const freq = detector(dataArray);
+      if (freq && !isNaN(freq)) {
+        updateTuner(freq);
+        verifyPitch(freq);
+      } else {
+        updateTuner(null);
+      }
       requestAnimationFrame(listenLoop);
     }
 
-    /************ HELPERS ************/
+    /************ MATH HELPERS ************/
     function midiToName(m) {
       const names = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
       return names[m % 12] + Math.floor(m / 12 - 1);
     }
-    function freqToMidiFloat(f) {
-      return 69 + 12 * Math.log2(f / 440);
-    }
-    function roundedMidi(f) { return Math.round(freqToMidiFloat(f)); }
-    function midiToFreq(m) { return 440 * Math.pow(2, (m - 69) / 12); }
-    function randomInt(min, max) { return Math.floor(Math.random() * (max - min + 1)) + min; }
+    const freqToMidiFloat = f => 69 + 12 * Math.log2(f / 440);
+    const midiToFreq = m => 440 * Math.pow(2, (m - 69) / 12);
+    const rnd = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min;
 
     /************ GAME LOGIC ************/
     function generateTarget() {
       const specific = stringModeChk.checked;
-      const midi = randomInt(lowestMidi, highestMidi);
-      let stringIndex = null, fret = null;
+      const midi = rnd(lowestMidi, highestMidi);
+      let stringIndex = null;
+
       if (specific) {
-        // choose string that can play the note within 0-20 frets
-        const valid = strings.map((s, idx) => {
+        // pick a random string that can play the note within available frets
+        const viable = strings.map((s, idx) => {
           const f = Math.round(12 * Math.log2(midiToFreq(midi) / s.openFreq));
-          return f >= 0 && f <= fretCount ? { idx, f } : null;
-        }).filter(Boolean);
-        const pick = valid[Math.floor(Math.random() * valid.length)];
-        stringIndex = pick.idx;
-        fret = pick.f;
+          return f >= 0 && f <= fretCount ? idx : null;
+        }).filter(i => i !== null);
+        stringIndex = viable[Math.floor(Math.random() * viable.length)];
       }
-      target = { midi, name: midiToName(midi), stringIndex, fret };
-      // display
-      targetEl.textContent = specific && stringIndex !== null
+
+      target = { midi, name: midiToName(midi), stringIndex };
+      targetEl.textContent = stringIndex !== null
         ? `${target.name} on ${strings[stringIndex].name} string`
         : target.name;
       messageEl.textContent = "Play the note!";
@@ -211,18 +231,23 @@
 
     function verifyPitch(freq) {
       if (waiting) return;
-      const detMidi = roundedMidi(freq);
-      if (detMidi === target.midi) {
+      const midiFloat = freqToMidiFloat(freq);
+      const centsDiff = (midiFloat - target.midi) * 100;
+      if (Math.abs(centsDiff) <= acceptCents) {
         waiting = true;
         messageEl.textContent = "Correct!";
         showMarkers();
-        setTimeout(() => { waiting = false; generateTarget(); }, 1500);
+        setTimeout(() => { waiting = false; generateTarget(); }, 1200);
       }
     }
 
-    /************ TUNER VIEW ************/
+    /************ TUNER UI ************/
     function updateTuner(freq) {
-      if (!freq) { tunerNoteEl.textContent = "--"; tunerCentsEl.textContent = ""; return; }
+      if (!freq) {
+        tunerNoteEl.textContent = "--";
+        tunerCentsEl.textContent = "";
+        return;
+      }
       const mf = freqToMidiFloat(freq);
       const nearest = Math.round(mf);
       const cents = (mf - nearest) * 100;
@@ -232,29 +257,27 @@
 
     /************ FRETBOARD MARKERS ************/
     function clearMarkers() { document.querySelectorAll(".marker").forEach(m => m.remove()); }
+
     function showMarkers() {
       clearMarkers();
-      const positions = getPositionsForMidi(target.midi, target.stringIndex);
-      positions.forEach(([idx, fret]) => {
-        const marker = document.createElement("div");
-        marker.className = "marker";
-        marker.style.top = `${paddingTop + idx * stringGap}px`;
-        marker.style.left = `${(fret / fretCount) * boardEl.clientWidth}px`;
-        boardEl.appendChild(marker);
-      });
-    }
-    function getPositionsForMidi(midi, specificIdx = null) {
-      const arr = [];
+      const positions = [];
       strings.forEach((s, idx) => {
-        if (specificIdx !== null && idx !== specificIdx) return;
-        const fret = Math.round(12 * Math.log2(midiToFreq(midi) / s.openFreq));
-        if (fret >= 0 && fret <= fretCount) arr.push([idx, fret]);
+        if (target.stringIndex !== null && idx !== target.stringIndex) return;
+        const fret = Math.round(12 * Math.log2(midiToFreq(target.midi) / s.openFreq));
+        if (fret >= 0 && fret <= fretCount) positions.push([idx, fret]);
       });
-      return arr;
+      positions.forEach(([idx, fret]) => {
+        const dot = document.createElement("div");
+        dot.className = "marker";
+        dot.style.left = `${(fret / fretCount) * boardEl.clientWidth}px`;
+        dot.style.top = `${paddingTop + idx * stringGap}px`;
+        boardEl.appendChild(dot);
+      });
     }
 
     /************ EVENTS ************/
     skipBtn.addEventListener("click", showMarkers);
+    nextBtn.addEventListener("click", () => { waiting = false; generateTarget(); });
     stringModeChk.addEventListener("change", generateTarget);
     window.addEventListener("resize", () => { buildBoard(); showMarkers(); });
 
