@@ -78,212 +78,202 @@
   <header>
     <span>Next note:</span>
     <span id="target-note">---</span>
-    <button id="skip-btn">Show me the correct note</button>
+    <button id="skip-btn">Show answer</button>
     <button id="next-btn">Next note</button>
     <label>
       <input type="checkbox" id="stringMode" /> Specify String
     </label>
   </header>
 
-  <div id="message">Play the note!</div>
+  <div id="message">Click anywhere to enable the mic 🎤</div>
   <div id="tuner"><span id="detected-note">--</span><span id="detected-cents"></span></div>
   <div id="fretboard"></div>
 
   <script>
-    /************ CONFIG ************/
+    /************ CONSTANTS ************/
     const strings = [
       { name: "G", openFreq: 98.0, midi: 43 },
       { name: "D", openFreq: 73.42, midi: 38 },
       { name: "A", openFreq: 55.0, midi: 33 },
       { name: "E", openFreq: 41.2, midi: 28 }
     ];
-    const lowestMidi = 28; // E1
-    const highestMidi = 62; // D4
-    const fretCount = 20;
-    const inlayFrets = [3, 5, 7, 9, 12, 15, 17, 19];
-    const acceptCents = 50; // pitch tolerance for a correct answer
+    const LOWEST_MIDI = 28;  // E1
+    const HIGHEST_MIDI = 62; // D4
+    const FRET_COUNT = 20;
+    const INLAY_FRETS = [3,5,7,9,12,15,17,19];
+    const ACCEPT_CENTS = 40; // tolerance
 
-    /************ STATE & DOM ************/
+    /************ STATE ************/
     let target = null;
     let waiting = false;
+    let audioReady = false;
 
-    const targetEl = document.getElementById("target-note");
-    const boardEl = document.getElementById("fretboard");
-    const messageEl = document.getElementById("message");
-    const skipBtn = document.getElementById("skip-btn");
-    const nextBtn = document.getElementById("next-btn");
-    const stringModeChk = document.getElementById("stringMode");
-    const tunerNoteEl = document.getElementById("detected-note");
-    const tunerCentsEl = document.getElementById("detected-cents");
+    /************ DOM ************/
+    const targetEl = document.getElementById('target-note');
+    const boardEl  = document.getElementById('fretboard');
+    const messageEl= document.getElementById('message');
+    const skipBtn  = document.getElementById('skip-btn');
+    const nextBtn  = document.getElementById('next-btn');
+    const stringChk= document.getElementById('stringMode');
+    const tunerNoteEl = document.getElementById('detected-note');
+    const tunerCentsEl= document.getElementById('detected-cents');
 
     /************ BUILD FRETBOARD ************/
-    let paddingTop, stringGap;
-    function buildBoard() {
-      boardEl.innerHTML = "";
-      paddingTop = 20;
-      stringGap = (boardEl.clientHeight - paddingTop * 2) / (strings.length - 1);
-
-      // strings
-      strings.forEach((_, i) => {
-        const line = document.createElement("div");
-        line.className = "string-line";
-        line.style.top = `${paddingTop + i * stringGap}px`;
-        boardEl.appendChild(line);
+    let paddingTop,stringGap;
+    function buildBoard(){
+      boardEl.innerHTML='';
+      paddingTop=20;
+      stringGap=(boardEl.clientHeight-paddingTop*2)/(strings.length-1);
+      strings.forEach((_,i)=>{
+        const l=document.createElement('div');
+        l.className='string-line';
+        l.style.top=`${paddingTop+i*stringGap}px`;
+        boardEl.appendChild(l);
       });
-
-      // frets
-      for (let f = 0; f <= fretCount; f++) {
-        const line = document.createElement("div");
-        line.className = "fret-line";
-        line.style.left = `${(f / fretCount) * 100}%`;
-        boardEl.appendChild(line);
+      for(let f=0;f<=FRET_COUNT;f++){
+        const l=document.createElement('div');
+        l.className='fret-line';
+        l.style.left=`${(f/FRET_COUNT)*100}%`;
+        boardEl.appendChild(l);
       }
-
-      // inlays
-      inlayFrets.forEach(f => {
-        if (f === 12) {
-          // double-dot: one above, one below centre
-          const xPct = ((f - 0.5) / fretCount) * 100;
-          const yCenter = boardEl.clientHeight / 2;
-          const offset = stringGap * 0.6;
-          [yCenter - offset, yCenter + offset].forEach(y => {
-            const dot = document.createElement("div");
-            dot.className = "inlay";
-            dot.style.left = `${xPct}%`;
-            dot.style.top = `${y}px`;
-            boardEl.appendChild(dot);
+      INLAY_FRETS.forEach(f=>{
+        const xPct=((f-0.5)/FRET_COUNT)*100;
+        if(f===12){
+          const off=stringGap*0.6;
+          [boardEl.clientHeight/2-off,boardEl.clientHeight/2+off].forEach(y=>{
+            const d=document.createElement('div');
+            d.className='inlay';
+            d.style.left=`${xPct}%`;d.style.top=`${y}px`;
+            boardEl.appendChild(d);
           });
-        } else {
-          const xPct = ((f - 0.5) / fretCount) * 100;
-          const dot = document.createElement("div");
-          dot.className = "inlay";
-          dot.style.left = `${xPct}%`;
-          dot.style.top = `${boardEl.clientHeight / 2}px`;
-          boardEl.appendChild(dot);
+        }else{
+          const d=document.createElement('div');
+          d.className='inlay';
+          d.style.left=`${xPct}%`;
+          d.style.top=`${boardEl.clientHeight/2}px`;
+          boardEl.appendChild(d);
         }
       });
     }
     requestAnimationFrame(buildBoard);
 
-    /************ AUDIO & DETECTION ************/
-    let audioCtx, analyser, dataArray, detector;
-    async function initAudio() {
-      try {
-        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-        const source = audioCtx.createMediaStreamSource(stream);
-        analyser = audioCtx.createAnalyser();
-        analyser.fftSize = 2048;
-        dataArray = new Float32Array(analyser.fftSize);
-        source.connect(analyser);
-        // AMDF tends to be more forgiving for bass frequencies
-        detector = Pitchfinder.AMDF({ sampleRate: audioCtx.sampleRate });
-        listenLoop();
-      } catch (err) {
-        messageEl.textContent = "Mic access denied.";
+    /************ AUDIO ************/
+    let audioCtx,analyser,dataArray,detector;
+    async function initAudio(){
+      if(audioReady) return;
+      try{
+        audioCtx=new(window.AudioContext||window.webkitAudioContext)();
+        await audioCtx.resume(); // ensure unlocked
+        const stream=await navigator.mediaDevices.getUserMedia({audio:true});
+        const src=audioCtx.createMediaStreamSource(stream);
+        analyser=audioCtx.createAnalyser();
+        analyser.fftSize=2048;
+        dataArray=new Float32Array(analyser.fftSize);
+        src.connect(analyser);
+        detector=Pitchfinder.AMDF({sampleRate:audioCtx.sampleRate});
+        audioReady=true;
+        messageEl.textContent='Mic enabled – play the note!';
+        listen();
+      }catch(err){
+        messageEl.textContent='⚠️ Mic access denied or unavailable';
         console.error(err);
       }
     }
-
-    function listenLoop() {
+    function listen(){
       analyser.getFloatTimeDomainData(dataArray);
-      const freq = detector(dataArray);
-      if (freq && !isNaN(freq)) {
-        updateTuner(freq);
-        verifyPitch(freq);
-      } else {
-        updateTuner(null);
-      }
-      requestAnimationFrame(listenLoop);
+      const freq=detector(dataArray);
+      if(freq){updateTuner(freq);verify(freq);}else updateTuner(null);
+      requestAnimationFrame(listen);
     }
 
-    /************ MATH HELPERS ************/
-    function midiToName(m) {
-      const names = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
-      return names[m % 12] + Math.floor(m / 12 - 1);
-    }
-    const freqToMidiFloat = f => 69 + 12 * Math.log2(f / 440);
-    const midiToFreq = m => 440 * Math.pow(2, (m - 69) / 12);
-    const rnd = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min;
-
-    /************ GAME LOGIC ************/
-    function generateTarget() {
-      const specific = stringModeChk.checked;
-      const midi = rnd(lowestMidi, highestMidi);
-      let stringIndex = null;
-
-      if (specific) {
-        // pick a random string that can play the note within available frets
-        const viable = strings.map((s, idx) => {
-          const f = Math.round(12 * Math.log2(midiToFreq(midi) / s.openFreq));
-          return f >= 0 && f <= fretCount ? idx : null;
-        }).filter(i => i !== null);
-        stringIndex = viable[Math.floor(Math.random() * viable.length)];
+    /************ UTIL ************/
+    const SHARP=['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'];
+    const FLAT =[ 'C','Db','D','Eb','E','F','Gb','G','Ab','A','Bb','B'];
+    function midiToDisplay(m){
+      let idx=m%12;let oct=Math.floor(m/12)-1;
+      if(idx>=9) oct+=1; // shift A/B up an octave label
+      const sharp=SHARP[idx]+oct;
+      if([1,3,6,8,10].includes(idx)){
+        return sharp+'/'+FLAT[idx]+oct;
       }
+      return sharp;
+    }
+    const freqToMidiFloat=f=>69+12*Math.log2(f/440);
+    const midiToFreq=m=>440*Math.pow(2,(m-69)/12);
+    const rnd=(min,max)=>Math.floor(Math.random()*(max-min+1))+min;
 
-      target = { midi, name: midiToName(midi), stringIndex };
-      targetEl.textContent = stringIndex !== null
-        ? `${target.name} on ${strings[stringIndex].name} string`
-        : target.name;
-      messageEl.textContent = "Play the note!";
+    /************ GAME ************/
+    function newTarget(){
+      const pickMidi=rnd(LOWEST_MIDI,HIGHEST_MIDI);
+      const noteIdx=pickMidi%12;
+      // Ensure octave 1 only covers up to G#1
+      if(Math.floor(pickMidi/12)-1===1 && noteIdx>=9){ // A1 or B1 -> bump by 12
+        targetMidi=pickMidi+12;
+      }
+      let midi=pickMidi;
+      if(Math.floor(midi/12)-1===1 && noteIdx>=9){midi+=12;} // shift A1,B1 up
+
+      let stringIndex=null;
+      if(stringChk.checked){
+        const viable=strings.map((s,idx)=>{
+          const fret=Math.round(12*Math.log2(midiToFreq(midi)/s.openFreq));
+          return fret>=0&&fret<=FRET_COUNT?idx:null;
+        }).filter(i=>i!==null);
+        stringIndex=viable[Math.floor(Math.random()*viable.length)];
+      }
+      target={midi,stringIndex};
+      targetEl.textContent=stringIndex!==null?`${midiToDisplay(midi)} on ${strings[stringIndex].name} string`:midiToDisplay(midi);
+      messageEl.textContent='Play the note!';
       clearMarkers();
+      updateTuner(null);
     }
 
-    function verifyPitch(freq) {
-      if (waiting) return;
-      const midiFloat = freqToMidiFloat(freq);
-      const centsDiff = (midiFloat - target.midi) * 100;
-      if (Math.abs(centsDiff) <= acceptCents) {
-        waiting = true;
-        messageEl.textContent = "Correct!";
+    function verify(freq){
+      if(waiting||!target) return;
+      const mf=freqToMidiFloat(freq);
+      const cents=(mf-target.midi)*100;
+      if(Math.abs(cents)<=ACCEPT_CENTS){
+        waiting=true;
+        messageEl.textContent='✅ Correct!';
         showMarkers();
-        setTimeout(() => { waiting = false; generateTarget(); }, 1200);
+        setTimeout(()=>{waiting=false;newTarget();},1000);
       }
     }
 
     /************ TUNER UI ************/
-    function updateTuner(freq) {
-      if (!freq) {
-        tunerNoteEl.textContent = "--";
-        tunerCentsEl.textContent = "";
-        return;
-      }
-      const mf = freqToMidiFloat(freq);
-      const nearest = Math.round(mf);
-      const cents = (mf - nearest) * 100;
-      tunerNoteEl.textContent = midiToName(nearest);
-      tunerCentsEl.textContent = `${cents >= 0 ? "+" : ""}${cents.toFixed(0)}¢`;
+    function updateTuner(freq){
+      if(!freq){tunerNoteEl.textContent='--';tunerCentsEl.textContent='';return;}
+      const mf=freqToMidiFloat(freq);const nearest=Math.round(mf);const cents=(mf-nearest)*100;
+      tunerNoteEl.textContent=midiToDisplay(nearest);
+      tunerCentsEl.textContent=`${cents>0?'+':''}${cents.toFixed(0)}¢`;
     }
 
-    /************ FRETBOARD MARKERS ************/
-    function clearMarkers() { document.querySelectorAll(".marker").forEach(m => m.remove()); }
-
-    function showMarkers() {
+    /************ MARKERS ************/
+    function clearMarkers(){document.querySelectorAll('.marker').forEach(m=>m.remove());}
+    function showMarkers(){
       clearMarkers();
-      const positions = [];
-      strings.forEach((s, idx) => {
-        if (target.stringIndex !== null && idx !== target.stringIndex) return;
-        const fret = Math.round(12 * Math.log2(midiToFreq(target.midi) / s.openFreq));
-        if (fret >= 0 && fret <= fretCount) positions.push([idx, fret]);
-      });
-      positions.forEach(([idx, fret]) => {
-        const dot = document.createElement("div");
-        dot.className = "marker";
-        dot.style.left = `${(fret / fretCount) * boardEl.clientWidth}px`;
-        dot.style.top = `${paddingTop + idx * stringGap}px`;
+      strings.forEach((s,idx)=>{
+        if(target.stringIndex!==null&&idx!==target.stringIndex) return;
+        const fret=Math.round(12*Math.log2(midiToFreq(target.midi)/s.openFreq));
+        if(fret<0||fret>FRET_COUNT) return;
+        const dot=document.createElement('div');
+        dot.className='marker';
+        dot.style.left=`${(fret/FRET_COUNT)*boardEl.clientWidth}px`;
+        dot.style.top=`${paddingTop+idx*stringGap}px`;
         boardEl.appendChild(dot);
       });
     }
 
     /************ EVENTS ************/
-    skipBtn.addEventListener("click", showMarkers);
-    nextBtn.addEventListener("click", () => { waiting = false; generateTarget(); });
-    stringModeChk.addEventListener("change", generateTarget);
-    window.addEventListener("resize", () => { buildBoard(); showMarkers(); });
+    document.body.addEventListener('click',initAudio,{once:true});
+    skipBtn.addEventListener('click',()=>{ensureAudio();showMarkers();});
+    nextBtn.addEventListener('click',()=>{ensureAudio();waiting=false;newTarget();});
+    stringChk.addEventListener('change',()=>{ensureAudio();newTarget();});
+    window.addEventListener('resize',()=>{buildBoard();showMarkers();});
+    function ensureAudio(){if(!audioReady) initAudio();}
 
-    /************ START ************/
-    generateTarget();
-    initAudio();
+    /************ KICK OFF ************/
+    newTarget();
   </script>
 </body>
 </html>
